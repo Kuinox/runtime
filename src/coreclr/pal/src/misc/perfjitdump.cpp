@@ -29,6 +29,10 @@
 
 #include "../inc/llvm/ELF.h"
 
+#if defined(HOST_AMD64)
+#include <x86intrin.h>
+#endif
+
 SET_DEFAULT_DEBUG_CHANNEL(MISC);
 
 namespace
@@ -37,6 +41,7 @@ namespace
     {
         JIT_DUMP_MAGIC = 0x4A695444,
         JIT_DUMP_VERSION = 1,
+        JITDUMP_FLAGS_ARCH_TIMESTAMP = 1 << 0,
 
 #if defined(HOST_X86)
         ELF_MACHINE = EM_386,
@@ -61,11 +66,26 @@ namespace
         JIT_CODE_LOAD = 0,
     };
 
-    static uint64_t GetTimeStampNS()
+    static uint64_t GetTimeStampNS(bool useArchTimestamp)
     {
+#if defined(HOST_AMD64)
+        if (useArchTimestamp) {
+            return static_cast<uint64_t>(__rdtsc());
+        }
+        #endif
         LARGE_INTEGER result;
         QueryPerformanceCounter(&result);
         return result.QuadPart;
+    }
+
+    static bool UseArchTimestamp()
+    {
+#if defined(HOST_AMD64)
+        const char* archTimestamp = getenv("JITDUMP_FLAGS_ARCH_TIMESTAMP");
+        return (archTimestamp != nullptr && strcmp(archTimestamp, "1") == 0);
+#else
+        return false;
+#endif
     }
 
     struct FileHeader
@@ -77,8 +97,8 @@ namespace
             elf_mach(ELF_MACHINE),
             pad1(0),
             pid(getpid()),
-            timestamp(GetTimeStampNS()),
-            flags(0)
+            timestamp(GetTimeStampNS(UseArchTimestamp())),
+            flags(UseArchTimestamp() ? JITDUMP_FLAGS_ARCH_TIMESTAMP : 0)
         {}
 
         uint32_t magic;
@@ -100,12 +120,12 @@ namespace
 
     struct JitCodeLoadRecord
     {
-        JitCodeLoadRecord() :
+        JitCodeLoadRecord(bool useArchTimestamp) :
             pid(getpid()),
             tid((uint32_t)THREADSilentGetCurrentThreadId())
         {
             header.id = JIT_CODE_LOAD;
-            header.timestamp = GetTimeStampNS();
+            header.timestamp = GetTimeStampNS(useArchTimestamp);
         }
 
         RecordHeader header;
@@ -126,13 +146,15 @@ struct PerfJitDumpState
         enabled(false),
         fd(-1),
         mmapAddr(MAP_FAILED),
-        codeIndex(0)
+        codeIndex(0),
+        useArchTimestamp(UseArchTimestamp())
     {}
 
     volatile bool enabled;
     int fd;
     void *mmapAddr;
     volatile uint64_t codeIndex;
+    const bool useArchTimestamp;
 
     int FatalError()
     {
@@ -230,11 +252,11 @@ exit:
         {
             size_t symbolLen = strlen(symbol);
 
-            JitCodeLoadRecord record;
+            JitCodeLoadRecord record(useArchTimestamp);
 
             size_t bytesRemaining = sizeof(JitCodeLoadRecord) + symbolLen + 1 + codeSize;
 
-            record.header.timestamp = GetTimeStampNS();
+            record.header.timestamp = GetTimeStampNS(useArchTimestamp);
             record.vma = (uint64_t) pCode;
             record.code_addr = (uint64_t) pCode;
             record.code_size = codeSize;
